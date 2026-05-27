@@ -1,0 +1,8 @@
+#!/bin/bash
+cc src/main.c -o main
+
+if [ $? -ne 0 ]; then
+    echo "Error."
+else
+    echo "Ok."
+fi
