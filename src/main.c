@@ -4,10 +4,16 @@
 #include <string.h>
 #include <limits.h>
 
+#ifdef _WIN32
+    #include <windows.h>
+#endif
+
 #define null NULL
 #define enforce(cond, msg) __enforce(cond, msg, __func__, __FILE__, __LINE__)
 
-typedef int8_t byte;
+#ifndef _WIN32
+    typedef int8_t byte;
+#endif
 typedef uint8_t ubyte;
 typedef uint16_t ushort;
 typedef uint32_t uint;
@@ -120,11 +126,15 @@ void arena_free(Arena *arena)
 
 int main(int argc, string *argv)
 {
+    #ifdef _WIN32
+        SetConsoleOutputCP(65001); // UTF-8
+    #endif
+
     enforce(argc != 2, "Esperado um unico argumento como arquivo.");
     
     Arena global = arena_create(1024u);
     GLOBAL_ARENA = &global;
-    
+
     string filename = argv[1];
     FILE* file = fopen(filename, "rb");
     enforce(file == null, "Erro ao abrir arquivo.");
@@ -135,7 +145,7 @@ int main(int argc, string *argv)
 
     string source = (string) arena_alloc(GLOBAL_ARENA, (uint) file_size);
     enforce(source == null, "Erro ao alocar memoria.");
-    fread(file, 1, file_size, file);
+    fread(source, 1, file_size, file);
     fclose(file);
 
     arena_free(GLOBAL_ARENA);
