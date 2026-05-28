@@ -1,5 +1,5 @@
 #!/bin/bash
-cc src/main.c -o main
+cc src/nubc.c -o nubc
 
 if [ $? -ne 0 ]; then
     echo "Error."
