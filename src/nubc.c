@@ -23,14 +23,28 @@ typedef uint64_t ulong;
 typedef struct _ArenaChunk ArenaChunk;
 typedef struct _Arena Arena;
 typedef struct _Lexer Lexer;
+typedef struct _Token Token;
 
 Arena *GLOBAL_ARENA = null;
-void *TOKENS = null; // salva de forma global mas genérica para não utilizar
+Token* TOKENS = null; // salva de forma global mas genérica para não utilizar
 
 void arena_free(Arena *arena);
 
-/// UTILS
+/// ERRORS
+#define ERR_FILE_NOT_FOUND "File not found."
+#define ERR_UNKOWN_TOKEN "Unknown token."
+#define ERR_FILE_EXPECTED "Expected a file as argument."
+#define ERR_OPEN_FILE "Failed to open file."
+#define ERR_MEM_ALLOC "Memory allocation failed."
+#define ERR_BIG_NUM "Number literal too long (max 23 digits)."
+#define ERR_ON_NUM "Invalid number literal."
+#define ERR_ON_DOUBLE "Number literal has multiple decimal points."
+#define ERR_LEXER_OOB "Lexer offset out of bounds."
+#define ERR_AN_ERROR "An error occurred."
+#define ERR_UINT_OVERFLOW "Uint overflow."
+#define ERR_READ_FILE "An error occurred while reading the file."
 
+/// UTILS
 typedef struct _NubStr
 {
     char *ptr;
@@ -56,13 +70,76 @@ void __enforce(int cond, const char *msg, const char *func, const char *file, in
         arena_free(GLOBAL_ARENA);
     if (TOKENS != null)
         free(TOKENS);
-    printf("Ocorreu um erro na função '%s()' em %s:%d\n", func, file, line);
-    printf("Mensagem: %s\n", msg);
+    printf("An error occurred in the function '%s()' in %s:%d\n", func, file, line);
+    printf("Message: %s\n", msg);
     exit(1);
 }
 
-// ARENA
+typedef enum _ErrKind
+{
+    ERR_WARNING,
+    ERR_ERROR,
+} ErrKind;
 
+typedef struct _Position
+{
+    char *filename, *dir;
+    struct
+    {
+        uint offset, line;
+    } start, end;
+} Position;
+
+void nubc_message(ErrKind kind, char *message, char *source, Position pos)
+{
+    /*
+     * file:l:o: ErrKind: 'MSG'
+     *
+     *     LINE
+     *     ^~~~
+     */
+
+    uint tab = 4;
+    size_t src_size = strlen(source);
+    uint current_line = 1;
+    char *line_start = source;
+
+    for (size_t i = 0; i < src_size; i++)
+    {
+        if (current_line == pos.start.line)
+            break;
+        if (source[i] == '\n')
+        {
+            current_line++;
+            line_start = &source[i + 1];
+        }
+    }
+
+    size_t line_len = 0;
+    while (line_start[line_len] != '\n' && line_start[line_len] != '\0')
+        line_len++;
+
+    fprintf(stderr, "%s:%u:%u: %s: '%s'\n",
+            pos.filename,
+            pos.start.line,
+            pos.start.offset + 2, // resolve o cursor do editor de código
+            kind == ERR_ERROR ? "error" : "warning",
+            message);
+
+    fprintf(stderr, "\n%*s%.*s\n", tab, "", (int)line_len, line_start);
+    fprintf(stderr, "%*s^", tab + (int)pos.start.offset, "");
+
+    uint span = pos.end.offset > pos.start.offset
+                    ? pos.end.offset - pos.start.offset - 1
+                    : 0;
+
+    for (uint i = 0; i < span; i++)
+        fputc('~', stderr);
+
+    fputc('\n', stderr);
+}
+
+// ARENA
 typedef struct _ArenaChunk
 {
     char *data;
@@ -84,10 +161,10 @@ static inline uint align(uint size, uint base)
 ArenaChunk *chunk_create(uint size)
 {
     ArenaChunk *chunk = (ArenaChunk *)calloc(1, sizeof(ArenaChunk));
-    enforce(chunk == null, "O Chunk alocado é nulo.");
+    enforce(chunk == null, ERR_MEM_ALLOC);
 
     char *data = (char *)calloc(1, size);
-    enforce(data == null, "O data alocado é nulo.");
+    enforce(data == null, ERR_MEM_ALLOC);
 
     chunk->cap = size;
     chunk->size = 0;
@@ -113,7 +190,7 @@ void *arena_alloc(Arena *arena, uint size)
     // caso de criar um novo chunk (REALLOC)
     if ((chunk->size + size) > chunk->cap)
     {
-        ArenaChunk *c = chunk_create(chunk->cap * 2);
+        ArenaChunk *c = chunk_create((chunk->cap + size) * 2);
         c->next = chunk;
         chunk = c;
         arena->chunk = chunk;
@@ -136,9 +213,6 @@ void arena_free(Arena *arena)
 }
 
 /// LEXER
-
-// typedef struct _Lexer Lexer;
-
 typedef enum _TokenKind
 {
     // keywords
@@ -162,15 +236,6 @@ typedef enum _TokenKind
     // eof
     TK_EOF, // só tem um caso de uso
 } TokenKind;
-
-typedef struct _Position
-{
-    char *filename, dir;
-    struct
-    {
-        uint offset, line;
-    } start, end;
-} Position;
 
 typedef struct _Token
 {
@@ -196,8 +261,8 @@ Lexer lexer_create(char *filename, uint filesize, char *source)
 {
     const uint CAP_INICIAL = 64u;
     Token *tokens = (Token *)calloc(1, sizeof(Token) * CAP_INICIAL);
+    enforce(tokens == null, ERR_MEM_ALLOC);
     TOKENS = tokens;
-    enforce(tokens == null, "Erro ao alocar tokens.");
     return (Lexer){
         .filename = filename,
         .line = 1,
@@ -213,14 +278,11 @@ Lexer lexer_create(char *filename, uint filesize, char *source)
 static inline void lexer_resize(Lexer *l)
 {
     uint new_cap = l->tk_cap * 2;
-    Token *tokens = (Token *)calloc(1, sizeof(Token) * new_cap);
-    for (uint i = 0; i < l->tk_size; i++)
-        tokens[i] = l->tokens[i];
-    free(l->tokens); // libera os tokens antigos
+    Token *tokens = (Token *)realloc(l->tokens, sizeof(Token) * new_cap); // o realloc ja vai liberar os TOKENS antigos se for um sucessos
+    enforce(tokens == null, ERR_MEM_ALLOC); // os tokens em TOKENS são os antigos, sem chances de free(null)
     l->tokens = tokens;
     TOKENS = tokens;
     l->tk_cap = new_cap;
-    printf("[DBG - RESIZE TOKENS]");
 }
 
 static inline void lexer_create_token(Lexer *l, Token tk)
@@ -233,7 +295,7 @@ static inline void lexer_create_token(Lexer *l, Token tk)
 static inline char lexer_advance(Lexer *l)
 {
     l->line_offset++;
-    enforce(l->offset >= l->filesize, "Erro ao avançar no lexer.");
+    enforce(l->offset >= l->filesize, ERR_LEXER_OOB);
     return l->source[l->offset++];
 }
 
@@ -252,6 +314,19 @@ static inline int lexer_match(Lexer *l, char ch)
     return 0;
 }
 
+static inline Position lexer_make_pos(Lexer *l, uint start)
+{
+    return (Position){
+        .dir = ".", // TODO: improve
+        .filename = l->filename,
+        .start.offset = start,
+        .start.line = l->line,
+        .end.offset = l->line_offset,
+        .end.line = l->line,
+    };
+}
+
+// lexer utils {{
 static inline int isNum(char ch)
 {
     return ch >= '0' && ch <= '9';
@@ -266,9 +341,11 @@ static inline int isAlphanum(char ch)
 {
     return isAlpha(ch) || isNum(ch);
 }
+// }}
 
-void lexer_tokenize(Lexer *l)
+ubyte lexer_tokenize(Lexer *l)
 {
+    ubyte err = 0;
     while (l->offset < l->filesize)
     {
         TokenKind k = TK_EOF;
@@ -313,7 +390,7 @@ void lexer_tokenize(Lexer *l)
                 break;
             }
 
-            lexer_create_token(l, (Token){.kind = kind, .str = (NubStr){.ptr = str, .len = len}});
+            lexer_create_token(l, (Token){.kind = kind, .str = (NubStr){.ptr = str, .len = len}, .pos = lexer_make_pos(l, start)});
             continue;
         }
 
@@ -325,7 +402,7 @@ void lexer_tokenize(Lexer *l)
             while ((isNum(lexer_peek(l)) || lexer_peek(l) == '.') && l->offset < l->filesize)
             {
                 lexer_advance(l);
-                enforce(lexer_peek(l) == '.' && isDouble == 1, "Voce não pode escrever '.' pra um double.");
+                enforce(lexer_peek(l) == '.' && isDouble == 1, ERR_ON_DOUBLE);
                 if (lexer_peek(l) == '.' && isDouble == 0)
                     isDouble = 1;
                 continue;
@@ -333,7 +410,7 @@ void lexer_tokenize(Lexer *l)
 
             uint end = l->offset;
             uint len = end - start;
-            enforce(len >= 24, "O numero é grande de mais.");
+            enforce(len >= 24, ERR_BIG_NUM);
 
             char *str_num = l->source + start;
             char buffer[24];
@@ -347,15 +424,16 @@ void lexer_tokenize(Lexer *l)
             char *endptr;
             errno = 0;
             Token tk;
+            Position pos = lexer_make_pos(l, start);
 
             if (isDouble)
-                tk = (Token){.kind = TK_NUMD, .numd = strtod(buffer, &endptr)};
+                tk = (Token){.kind = TK_NUMD, .numd = strtod(buffer, &endptr), .pos = pos};
             else if (isFloat)
-                tk = (Token){.kind = TK_NUMF, .numf = strtof(buffer, &endptr)};
+                tk = (Token){.kind = TK_NUMF, .numf = strtof(buffer, &endptr), .pos = pos};
             else
-                tk = (Token){.kind = TK_NUM, .num = strtol(buffer, &endptr, 10)};
+                tk = (Token){.kind = TK_NUM, .num = strtol(buffer, &endptr, 10), .pos = pos};
 
-            enforce(buffer == endptr || errno == ERANGE, "Erro ao converter numero.");
+            enforce(buffer == endptr || errno == ERANGE, ERR_ON_NUM);
             lexer_create_token(l, tk);
             continue;
         }
@@ -390,9 +468,10 @@ void lexer_tokenize(Lexer *l)
             continue;
         }
 
-        printf("'%c'\n", ch);
-        enforce(1, "Token desconhecido.");
+        nubc_message(ERR_ERROR, ERR_UNKOWN_TOKEN, l->source, lexer_make_pos(l, l->line_offset - 1));
+        err = 1;
     }
+    return err;
 }
 
 void lexer_debug(Lexer *l)
@@ -451,14 +530,13 @@ void lexer_debug(Lexer *l)
 /// PARSER
 
 /// MAIN
-
 int main(int argc, char **argv)
 {
 #ifdef _WIN32
     SetConsoleOutputCP(65001); // UTF-8
 #endif
 
-    enforce(argc != 2, "Esperado um unico argumento como arquivo.");
+    enforce(argc != 2, ERR_FILE_EXPECTED);
 
     // arenas
     const uint ARENA_CAP = 1024u;
@@ -469,20 +547,26 @@ int main(int argc, char **argv)
     // readfile
     char *filename = argv[1];
     FILE *file = fopen(filename, "rb");
-    enforce(file == null, "Erro ao abrir arquivo.");
+    enforce(file == null, ERR_OPEN_FILE);
 
     fseek(file, 0, SEEK_END);
     uint file_size = (uint)ftell(file);
+    enforce(file_size == UINT32_MAX, ERR_UINT_OVERFLOW); // valida se o cast foi valido
     rewind(file);
 
     char *source = (char *)arena_alloc(GLOBAL_ARENA, (uint)file_size);
-    enforce(source == null, "Erro ao alocar memoria.");
+    enforce(source == null, ERR_MEM_ALLOC);
     fread(source, 1, file_size, file);
+    enforce(strlen(source) != file_size, ERR_READ_FILE); // garante que o numero de bytes lidos foi o total do file_size
     fclose(file);
+
+    // errors
+    ubyte err = 0;
 
     // lexer
     Lexer lexer = lexer_create(filename, file_size, source);
-    lexer_tokenize(&lexer);
+    err = lexer_tokenize(&lexer);
+    enforce(err > 0, ERR_AN_ERROR);
     lexer_debug(&lexer);
 
     // end
