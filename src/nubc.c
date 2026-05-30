@@ -24,9 +24,11 @@ typedef struct _ArenaChunk ArenaChunk;
 typedef struct _Arena Arena;
 typedef struct _Lexer Lexer;
 typedef struct _Token Token;
+typedef struct _Node Node;
 
 Arena *GLOBAL_ARENA = null;
-Token* TOKENS = null; // salva de forma global mas genérica para não utilizar
+Token *TOKENS = null;
+Node *NODES = null;
 
 void arena_free(Arena *arena);
 
@@ -40,9 +42,12 @@ void arena_free(Arena *arena);
 #define ERR_ON_NUM "Invalid number literal."
 #define ERR_ON_DOUBLE "Number literal has multiple decimal points."
 #define ERR_LEXER_OOB "Lexer offset out of bounds."
-#define ERR_AN_ERROR "An error occurred."
+#define ERR_AN_ERROR "An error occurred at some stage of the compiler."
 #define ERR_UINT_OVERFLOW "Uint overflow."
 #define ERR_READ_FILE "An error occurred while reading the file."
+#define ERR_LEXER_INVALID_CHAR "Invalid literal character."
+#define ERR_LEXER_INVALID_CHAR_ESCAPE "Invalid escape character."
+#define ERR_LEXER_INVALID_STRING "Invalid string."
 
 /// UTILS
 typedef struct _NubStr
@@ -70,6 +75,8 @@ void __enforce(int cond, const char *msg, const char *func, const char *file, in
         arena_free(GLOBAL_ARENA);
     if (TOKENS != null)
         free(TOKENS);
+    if (NODES != null)
+        free(NODES);
     printf("An error occurred in the function '%s()' in %s:%d\n", func, file, line);
     printf("Message: %s\n", msg);
     exit(1);
@@ -218,20 +225,34 @@ typedef enum _TokenKind
     // keywords
     TK_FN,
     TK_RETURN,
+    TK_VAR,
+    TK_CONST,
+    TK_IF,
+    TK_ELSE,
+    TK_FOR,
+    TK_WHILE,
 
     // literals
     TK_ID,
     TK_NUM,
     TK_NUMD, // double
     TK_NUMF, // float
+    TK_STRING,
+    TK_CHAR,
 
     // symbols
-    TK_LBRACE, // {
-    TK_RBRACE, // }
-    TK_LPREN,  // (
-    TK_RPREN,  // )
-    TK_PLUS,   // +
-    TK_MINUS,  // -
+    TK_LBRACE,    // {
+    TK_RBRACE,    // }
+    TK_LPREN,     // (
+    TK_RPREN,     // )
+    TK_PLUS,      // +
+    TK_MINUS,     // -
+    TK_EQUALS,    // =
+    TK_EEQUALS,   // ==
+    TK_COLON,     // :
+    TK_SEMICOLON, // ;
+    TK_COMMA,     // ,
+    TK_DOT,       // .
 
     // eof
     TK_EOF, // só tem um caso de uso
@@ -242,7 +263,7 @@ typedef struct _Token
     TokenKind kind;
     union
     {
-        long num;
+        long num; // pode armazenar 'char' sem problemas
         double numd;
         float numf;
         NubStr str;
@@ -279,7 +300,7 @@ static inline void lexer_resize(Lexer *l)
 {
     uint new_cap = l->tk_cap * 2;
     Token *tokens = (Token *)realloc(l->tokens, sizeof(Token) * new_cap); // o realloc ja vai liberar os TOKENS antigos se for um sucessos
-    enforce(tokens == null, ERR_MEM_ALLOC); // os tokens em TOKENS são os antigos, sem chances de free(null)
+    enforce(tokens == null, ERR_MEM_ALLOC);                               // os tokens em TOKENS são os antigos, sem chances de free(null)
     l->tokens = tokens;
     TOKENS = tokens;
     l->tk_cap = new_cap;
@@ -381,6 +402,28 @@ ubyte lexer_tokenize(Lexer *l)
             case 'f':
                 if (len == 4 && memcmp(str, "func", 4) == 0)
                     kind = TK_FN;
+                if (len == 3 && memcmp(str, "for", 3) == 0)
+                    kind = TK_FOR;
+                break;
+            case 'i':
+                if (len == 2 && memcmp(str, "if", 2) == 0)
+                    kind = TK_IF;
+                break;
+            case 'e':
+                if (len == 4 && memcmp(str, "else", 4) == 0)
+                    kind = TK_ELSE;
+                break;
+            case 'c':
+                if (len == 5 && memcmp(str, "const", 5) == 0)
+                    kind = TK_CONST;
+                break;
+            case 'w':
+                if (len == 5 && memcmp(str, "while", 5) == 0)
+                    kind = TK_WHILE;
+                break;
+            case 'v':
+                if (len == 3 && memcmp(str, "var", 3) == 0)
+                    kind = TK_VAR;
                 break;
             case 'r':
                 if (len == 6 && memcmp(str, "return", 6) == 0)
@@ -398,11 +441,20 @@ ubyte lexer_tokenize(Lexer *l)
         {
             int isDouble = 0;
             uint start = l->offset - 1;
+            uint pstart = l->line_offset - 1;
 
             while ((isNum(lexer_peek(l)) || lexer_peek(l) == '.') && l->offset < l->filesize)
             {
                 lexer_advance(l);
-                enforce(lexer_peek(l) == '.' && isDouble == 1, ERR_ON_DOUBLE);
+                if (lexer_peek(l) == '.' && isDouble == 1)
+                {
+                    // o pstart inicia antes do numero (pstart - 1)
+                    // pstart + 1 => 67
+                    // pstart + 2 => .
+                    // pstart + 3 => .
+                    nubc_message(ERR_ERROR, ERR_ON_DOUBLE, l->source, lexer_make_pos(l, pstart + 3)); // o + 3 move o ponteiro do erro pro '.' problematico
+                    err = 1;
+                }
                 if (lexer_peek(l) == '.' && isDouble == 0)
                     isDouble = 1;
                 continue;
@@ -424,7 +476,7 @@ ubyte lexer_tokenize(Lexer *l)
             char *endptr;
             errno = 0;
             Token tk;
-            Position pos = lexer_make_pos(l, start);
+            Position pos = lexer_make_pos(l, pstart);
 
             if (isDouble)
                 tk = (Token){.kind = TK_NUMD, .numd = strtod(buffer, &endptr), .pos = pos};
@@ -435,6 +487,94 @@ ubyte lexer_tokenize(Lexer *l)
 
             enforce(buffer == endptr || errno == ERANGE, ERR_ON_NUM);
             lexer_create_token(l, tk);
+            continue;
+        }
+
+        if (ch == '"')
+        {
+            uint start = l->line_offset;
+            uint ptr_start = l->offset;
+
+            while (lexer_peek(l) != '"' && l->offset < l->filesize)
+            {
+                if (lexer_match(l, '\n'))
+                    break;
+                if (lexer_match(l, '\\'))
+                {
+                    switch (lexer_peek(l))
+                    {
+                    case 'r':
+                    case 'n':
+                    case 't':
+                    case '\\':
+                    case '0':
+                        break;
+                    default:
+                        nubc_message(ERR_ERROR, ERR_LEXER_INVALID_CHAR_ESCAPE, l->source, lexer_make_pos(l, start - 1));
+                        err = 1;
+                        break;
+                    }
+                }
+                lexer_advance(l);
+                continue;
+            }
+
+            if (!lexer_match(l, '"'))
+            {
+                nubc_message(ERR_ERROR, ERR_LEXER_INVALID_STRING, l->source, lexer_make_pos(l, start));
+                err = 1;
+                continue;
+            }
+
+            uint end = l->line_offset - 1;
+            char *str = l->source + ptr_start;
+            uint len = end - start;
+
+            lexer_create_token(l, (Token){.kind = TK_STRING, .str = (NubStr){.ptr = str, .len = len}, .pos = lexer_make_pos(l, start - 1)});
+            continue;
+        }
+
+        if (ch == '\'')
+        {
+            uint start = l->line_offset;
+            char c = lexer_advance(l);
+
+            if (c == '\\')
+            {
+                lexer_advance(l); // avança o caractere de escape
+                switch (lexer_peek(l))
+                {
+                case 'n':
+                    c = '\n';
+                    break;
+                case 'r':
+                    c = '\r';
+                    break;
+                case 't':
+                    c = '\t';
+                    break;
+                case '\\':
+                    c = '\\';
+                    break;
+                case '0':
+                    c = '\0';
+                    break;
+                default:
+                    nubc_message(ERR_ERROR, ERR_LEXER_INVALID_CHAR_ESCAPE, l->source, lexer_make_pos(l, start - 1));
+                    err = 1;
+                    break;
+                }
+                lexer_advance(l);
+            }
+
+            if (!lexer_match(l, '\''))
+            {
+                nubc_message(ERR_ERROR, ERR_LEXER_INVALID_CHAR, l->source, lexer_make_pos(l, start - 1));
+                err = 1;
+                continue;
+            }
+
+            lexer_create_token(l, (Token){.kind = TK_CHAR, .num = (long)c, .pos = lexer_make_pos(l, start - 1)});
             continue;
         }
 
@@ -457,6 +597,24 @@ ubyte lexer_tokenize(Lexer *l)
             break;
         case '-':
             k = TK_MINUS;
+            break;
+        case '=':
+            if (lexer_peek(l) == '=')
+                k = TK_EEQUALS;
+            else
+                k = TK_EQUALS;
+            break;
+        case ':':
+            k = TK_COLON;
+            break;
+        case ';':
+            k = TK_SEMICOLON;
+            break;
+        case ',':
+            k = TK_COMMA;
+            break;
+        case '.':
+            k = TK_DOT;
             break;
         default:
             break;
@@ -519,8 +677,50 @@ void lexer_debug(Lexer *l)
         case TK_NUMF:
             printf("[FLOAT %f] ", tk.numf);
             continue;
+        case TK_EQUALS:
+            printf("[EQUALS] ");
+            continue;
+        case TK_EEQUALS:
+            printf("[EEQUALS] ");
+            continue;
+        case TK_STRING:
+            printf("[STRING '%.*s'] ", tk.str.len, tk.str.ptr);
+            continue;
+        case TK_COLON:
+            printf("[COLON] ");
+            continue;
+        case TK_COMMA:
+            printf("[COMMA] ");
+            continue;
+        case TK_SEMICOLON:
+            printf("[SEMICOLON] ");
+            continue;
+        case TK_DOT:
+            printf("[DOT] ");
+            continue;
+        case TK_CHAR:
+            printf("[CHAR '%c'] ", (char)tk.num);
+            continue;
+        case TK_VAR:
+            printf("[VAR] ");
+            continue;
+        case TK_CONST:
+            printf("[CONST] ");
+            continue;
+        case TK_IF:
+            printf("[IF] ");
+            continue;
+        case TK_ELSE:
+            printf("[ELSE] ");
+            continue;
+        case TK_FOR:
+            printf("[FOR] ");
+            continue;
+        case TK_WHILE:
+            printf("[WHILE] ");
+            continue;
         default:
-            printf("[DESCONHECIDO]");
+            printf("[DESCONHECIDO] ");
             continue;
         }
     }
@@ -528,6 +728,70 @@ void lexer_debug(Lexer *l)
 }
 
 /// PARSER
+typedef enum _NodeKind
+{
+    NODE_PROGRAM,
+
+    NODE_BINARYEXPR,
+    NODE_UNARYEXPR,
+
+    NODE_INT_LIT,
+    NODE_STR_LIT,
+    NODE_CHAR_LIT,
+    NODE_DOUBLE_LIT,
+    NODE_FLOAT_LIT,
+
+    NODE_FNDECL,
+
+    NODE_RETURNSTMT,
+} NodeKind;
+
+typedef struct _NodeProgram
+{
+    Node **body;
+    uint len;
+} NodeProgram;
+
+typedef struct _NodeBinaryExpr
+{
+    Node *left, *right;
+    TokenKind op;
+} NodeBinaryExpr;
+
+typedef struct _NodeUnaryExpr
+{
+    Node *val;
+    TokenKind op;
+} NodeUnaryExpr;
+
+typedef struct _NodeReturnStmt
+{
+    Node *val;
+} NodeReturnStmt;
+
+typedef struct _Node
+{
+    NodeKind kind;
+    union
+    {
+        NodeProgram program;
+        NodeBinaryExpr binaryExpr;
+        NodeUnaryExpr unaryExpr;
+        NodeReturnStmt retStmt;
+        double doubleLit;
+        float floatLit;
+        NubStr strLit;
+        char chLit;
+        long intLit;
+    } value;
+    Position pos;
+} Node;
+
+typedef struct _Parser
+{
+    Node *program;
+    char* source;
+} Parser;
 
 /// MAIN
 int main(int argc, char **argv)
@@ -570,7 +834,10 @@ int main(int argc, char **argv)
     lexer_debug(&lexer);
 
     // end
-    free(TOKENS);
+    if (TOKENS != null)
+        free(TOKENS);
+    if (NODES != null)
+        free(NODES);
     arena_free(GLOBAL_ARENA);
     return 0;
 }
