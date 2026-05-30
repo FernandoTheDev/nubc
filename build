@@ -1,8 +1,104 @@
 #!/bin/bash
-cc src/nubc.c -o nubc
+set -e
 
-if [ $? -ne 0 ]; then
-    echo "Error."
-else
-    echo "Ok."
+CC=${CC:-cc}
+SRC=src/nubc.c
+OUT=nubc
+INSTALL_DIR="/usr/local/bin"
+
+STRIP=0
+UPX=0
+OPT="-O2"
+DEBUG=0
+INSTALL=0
+UNINSTALL=0
+
+usage() {
+    echo "usage: $0 [options]"
+    echo "  -s        strip binary"
+    echo "  -u        compress with upx (implies -s)"
+    echo "  -O<n>     optimization level (0,1,2,3,s) [default: 2]"
+    echo "  -g        debug build (-O0 -g, disables -s and -u)"
+    echo "  -i        install to $INSTALL_DIR (may require sudo)"
+    echo "  -r        uninstall from $INSTALL_DIR (may require sudo)"
+    echo "  -h        this help"
+    exit 0
+}
+
+while getopts "suO:gfirh" opt; do
+    case $opt in
+        s) STRIP=1 ;;
+        u) UPX=1; STRIP=1 ;;
+        O) OPT="-O$OPTARG" ;;
+        g) DEBUG=1; OPT="-O0 -g"; STRIP=0; UPX=0 ;;
+        i) INSTALL=1 ;;
+        r) UNINSTALL=1 ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+install_bin() {
+    local bin=$1
+    echo ">> installing $bin to $INSTALL_DIR..."
+    if [ -w "$INSTALL_DIR" ]; then
+        cp $bin $INSTALL_DIR/$bin
+    else
+        sudo cp $bin $INSTALL_DIR/$bin
+    fi
+    echo ">> installed: $INSTALL_DIR/$bin"
+}
+
+uninstall_bin() {
+    local bin=$1
+    local target="$INSTALL_DIR/$bin"
+    if [ -f "$target" ]; then
+        echo ">> removing $target..."
+        if [ -w "$INSTALL_DIR" ]; then
+            rm "$target"
+        else
+            sudo rm "$target"
+        fi
+        echo ">> removed: $target"
+    else
+        echo ">> warning: $target not found, skipping."
+    fi
+}
+
+if [ $UNINSTALL -eq 1 ]; then
+    uninstall_bin $OUT
+    [ $FILC -eq 1 ] && uninstall_bin fil$OUT
+    exit 0
 fi
+
+build() {
+    local compiler=$1
+    local out=$2
+
+    echo ">> building $out ($compiler $OPT)..."
+    $compiler $SRC -o $out $OPT -Wall -Wextra -std=c11
+
+    if [ $STRIP -eq 1 ]; then
+        echo ">> stripping..."
+        strip $out
+    fi
+
+    if [ $UPX -eq 1 ]; then
+        if command -v upx &>/dev/null; then
+            echo ">> compressing with upx..."
+            upx --best --lzma $out
+        else
+            echo ">> warning: upx not found, skipping."
+        fi
+    fi
+
+    echo ">> done. ($(du -sh $out | cut -f1))"
+
+    if [ $INSTALL -eq 1 ]; then
+        install_bin $out
+    fi
+
+    echo ""
+}
+
+build $CC $OUT

@@ -1,4 +1,4 @@
-func main() {
+fun main() {
     var name = "Fernando"
     var x = 'A'
 }
