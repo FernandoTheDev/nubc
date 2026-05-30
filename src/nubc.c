@@ -9,6 +9,7 @@
 #include <windows.h>
 #endif
 
+#define NUBC_VERSION "0.1.0"
 #define null NULL
 #define enforce(cond, msg) __enforce(cond, msg, __func__, __FILE__, __LINE__)
 
@@ -885,19 +886,23 @@ typedef struct _Node
 typedef struct _Parser
 {
     List *list;
+    // nodes top level, salvos como ELEM_REF apenas, serve pra controlar a visibilidade
+    // enquanto o list tem todos os nodes alocados sem hierarquia, o program salva a hierarquia e a estrutura original
+    List *program;
     uint tk_len, offset;
     char *source;
 } Parser;
 
 static inline Parser parser_create(char *source, uint len)
 {
-    return (Parser){.source = source, .list = list_create(32), .tk_len = len, .offset = 0};
+    return (Parser){.source = source, .list = list_create(32L), .program = list_create(32L), .tk_len = len, .offset = 0};
 }
 
-static inline Node *node_create()
+static inline Node *node_create(Parser* p)
 {
     Node *node = (Node *)calloc(1, sizeof(Node));
     enforce(node == null, ERR_MEM_ALLOC);
+    list_push(p->list, node, ELEM_RAW);
     return node;
 }
 
@@ -912,6 +917,7 @@ typedef enum _ParserPrecedence
 // parser_prototipos {{
 ParserPrecedence parser_get_precedence(Token *tk);
 static inline Node *parser_parse_intern(Parser *p);
+Node *parser_parse_expr(Parser *p, ParserPrecedence precedence);
 // }}
 
 static inline Token *parser_peek(Parser *p)
@@ -1009,15 +1015,24 @@ Node *parser_parse_decl(Parser *p)
         parser_consume(p, TK_LBRACE, "Esperado '{' após os argumentos.");
 
         while (!parser_check(p, TK_RBRACE))
-            list_push(body, parser_parse_intern(p), ELEM_RAW);
+        {
+            Node *node = parser_parse_intern(p);
+            if (node == null) // TODO: remover retorno nulo
+            {
+                p->offset++;
+                continue;
+            }
+            list_push(body, node, ELEM_REF); // todos serão destruidos no p.list
+        }
 
         parser_consume(p, TK_RBRACE, "Esperado '}' após a função.");
 
-        Node *n = node_create();
+        Node *n = node_create(p);
         n->kind = NODE_FNDECL;
         n->value.fnDecl.name = name->str;
         n->value.fnDecl.arguments = args;
         n->value.fnDecl.body = body;
+        n->pos = name->pos;
         return n;
     }
     default:
@@ -1027,22 +1042,47 @@ Node *parser_parse_decl(Parser *p)
 
 Node *parser_parse_stmt(Parser *p)
 {
-    return null;
+    Token *tk = parser_peek(p);
+    switch (tk->kind)
+    {
+    case TK_RETURN:
+    {
+        parser_advance(p);
+        Node *nret = node_create(p);
+        nret->kind = NODE_RETURNSTMT;
+        nret->value.retStmt.val = parser_parse_expr(p, PRE_LOW);
+        nret->pos = tk->pos;
+        return nret;
+    }
+    default:
+        return null;
+    }
 }
 
 // parse_expr {{
 Node *parser_parse_expr_nud(Parser *p)
 {
-    Token *tk = parser_peek(p);
+    Token *tk = parser_advance(p);
     switch (tk->kind)
     {
     case TK_NUM:
-        parser_advance(p);
-        Node *num = node_create();
+        Node *num = node_create(p);
         num->kind = NODE_INT_LIT;
-        num->pos = num->pos;
+        num->pos = tk->pos;
         num->value.intLit = tk->num;
         return num;
+    case TK_NUMF:
+        Node *numf = node_create(p);
+        numf->kind = NODE_FLOAT_LIT;
+        numf->pos = tk->pos;
+        numf->value.floatLit = tk->numf;
+        return numf;
+    case TK_NUMD:
+        Node *numd = node_create(p);
+        numd->kind = NODE_DOUBLE_LIT;
+        numd->pos = tk->pos;
+        numd->value.doubleLit = tk->numd;
+        return numd;
     default:
         return null;
     }
@@ -1050,14 +1090,22 @@ Node *parser_parse_expr_nud(Parser *p)
 
 Node *parser_parse_expr_led(Parser *p, Node *left)
 {
-    Token *tk = parser_peek(p);
+    Token *tk = parser_advance(p);
     switch (tk->kind)
     {
     case TK_PLUS:
     case TK_MINUS:
     case TK_STAR:
     case TK_SLASH:
-        return left; // TODO: binary expr
+    {
+        Node *nbexpr = node_create(p);
+        nbexpr->kind = NODE_BINARYEXPR;
+        nbexpr->pos = tk->pos;
+        nbexpr->value.binaryExpr.left = left;
+        nbexpr->value.binaryExpr.op = tk->kind;
+        nbexpr->value.binaryExpr.right = parser_parse_expr(p, parser_get_precedence(tk));
+        return nbexpr;
+    }
     default:
         return left;
     }
@@ -1100,7 +1148,6 @@ static inline Node *parser_parse_intern(Parser *p)
 
 void parser_parse(Parser *p)
 {
-    List *l = p->list;
     while (p->offset < p->tk_len)
     {
         Node *node = parser_parse_intern(p);
@@ -1109,7 +1156,24 @@ void parser_parse(Parser *p)
             p->offset++;
             continue;
         }
-        list_push(l, node, ELEM_RAW);
+        list_push(p->program, node, ELEM_REF);
+    }
+}
+
+static inline char *node_debug_op(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TK_PLUS:
+        return "+";
+    case TK_MINUS:
+        return "-";
+    case TK_STAR:
+        return "*";
+    case TK_SLASH:
+        return "/";
+    default:
+        return "<undefined>";
     }
 }
 
@@ -1117,6 +1181,12 @@ static inline void node_debug(Node *n, uint depth)
 {
     for (uint i = 0; i < depth; i++)
         printf("  ");
+
+    if (n == null)
+    {
+        printf("[NODE NULL]\n");
+        return;
+    }
 
     switch (n->kind)
     {
@@ -1132,12 +1202,12 @@ static inline void node_debug(Node *n, uint depth)
             node_debug(n->value.retStmt.val, depth + 1);
         break;
     case NODE_BINARYEXPR:
-        printf("[BINARY %d]\n", n->value.binaryExpr.op);
+        printf("[BINARY '%s']\n", node_debug_op(n->value.binaryExpr.op));
         node_debug(n->value.binaryExpr.left, depth + 1);
         node_debug(n->value.binaryExpr.right, depth + 1);
         break;
     case NODE_UNARYEXPR:
-        printf("[UNARY %d]\n", n->value.unaryExpr.op);
+        printf("[UNARY '%s']\n", node_debug_op(n->value.unaryExpr.op));
         node_debug(n->value.unaryExpr.val, depth + 1);
         break;
     case NODE_INT_LIT:
@@ -1160,22 +1230,138 @@ static inline void node_debug(Node *n, uint depth)
 
 static inline void parser_debug(Parser *p)
 {
-    for (uint i = 0; i < p->list->size; i++)
+    for (uint i = 0; i < p->program->size; i++)
     {
-        list_data d = p->list->data[i];
-        if (d.flag == ELEM_RAW)
+        list_data d = p->program->data[i];
+        if (d.flag == ELEM_REF)
             node_debug((Node *)d.ptr, 0);
     }
 }
 
 /// MAIN
+typedef struct NubcArgs
+{
+    uint8_t help;
+    uint8_t version;
+    uint8_t opt;
+    uint8_t l_debug;
+    uint8_t p_debug;
+    char *output;
+} NubcArgs;
+
+static inline void cli_flag_help()
+{
+    printf(
+        "Nub Compiler (nubc) - %s\n"
+        "\n"
+        "Usage: nubc [flags] <file.nub>\n"
+        "\n"
+        "Flags:\n"
+        "    -h, -help       Display the help message.\n"
+        "    -ldebug         Show tokens\n"
+        "    -pdebug         Show AST\n"
+        "    -v, -version    Show version\n"
+        "    -O<n>           Optimization level (0-3)\n"
+        "    -o <file>       Output file (default: a.out)\n",
+        NUBC_VERSION);
+}
+
+static inline void cli_flag_version()
+{
+    printf("Nub Compiler (nubc) - %s\n", NUBC_VERSION);
+}
+
+NubcArgs cli_parse_args(char **filename, int argc, char **argv)
+{
+    NubcArgs args = {0};
+    args.output = "a.out";
+
+    for (int i = 1; i < argc; i++)
+    {
+        char *arg = argv[i];
+        if (arg[0] != '-')
+        {
+            *filename = arg;
+            continue;
+        }
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "-help") == 0)
+        {
+            args.help = 1;
+            continue;
+        }
+        else if (strcmp(arg, "-v") == 0 || strcmp(arg, "-version") == 0)
+        {
+            args.version = 1;
+            continue;
+        }
+        else if (strcmp(arg, "-ldebug") == 0)
+        {
+            args.l_debug = 1;
+            continue;
+        }
+        else if (strcmp(arg, "-pdebug") == 0)
+        {
+            args.p_debug = 1;
+            continue;
+        }
+        else if (strncmp(arg, "-O", 2) == 0)
+        {
+            if (strlen(arg) != 3)
+            {
+                fprintf(stderr, "error: -O expects a value, e.g. -O1\n");
+                exit(1);
+            }
+            int O = arg[2] - '0';
+            if (O < 0 || O > 3)
+            {
+                fprintf(stderr, "error: -O value must be between 0 and 3\n");
+                exit(1);
+            }
+            args.opt = O;
+            continue;
+        }
+        else if (strcmp(arg, "-o") == 0)
+        {
+            if (i + 1 >= argc)
+            {
+                fprintf(stderr, "error: -o expects an argument\n");
+                exit(1);
+            }
+            args.output = argv[++i];
+            continue;
+        }
+        else
+        {
+            fprintf(stderr, "error: unknown flag '%s'\n", arg);
+            exit(1);
+        }
+    }
+
+    return args;
+}
+
 int main(int argc, char **argv)
 {
 #ifdef _WIN32
     SetConsoleOutputCP(65001); // UTF-8
 #endif
+    char *filename = null;
+    NubcArgs args = cli_parse_args(&filename, argc, argv);
 
-    enforce(argc != 2, ERR_FILE_EXPECTED);
+    if (args.help || argc == 1)
+    {
+        cli_flag_help();
+        return 0;
+    }
+
+    if (args.version)
+    {
+        cli_flag_version();
+        return 0;
+    }
+
+    enforce(filename == null, ERR_FILE_EXPECTED);
 
     // arenas
     const uint ARENA_CAP = 1024u;
@@ -1184,7 +1370,6 @@ int main(int argc, char **argv)
     GLOBAL_ARENA = &a_global;
 
     // readfile
-    char *filename = argv[1];
     FILE *file = fopen(filename, "rb");
     enforce(file == null, ERR_OPEN_FILE);
 
@@ -1210,13 +1395,16 @@ int main(int argc, char **argv)
     Lexer lexer = lexer_create(filename, file_size, source);
     err = lexer_tokenize(&lexer);
     enforce(err > 0, ERR_AN_ERROR);
-    lexer_debug(&lexer);
+    if (args.l_debug)
+        lexer_debug(&lexer);
 
     // parser
     Parser parser = parser_create(source, lexer.tk_size);
     list_push(GLOBAL_LIST, parser.list, ELEM_LIST);
+    list_push(GLOBAL_LIST, parser.program, ELEM_LIST);
     parser_parse(&parser);
-    parser_debug(&parser);
+    if (args.p_debug)
+        parser_debug(&parser);
 
     // end
     free(TOKENS);
